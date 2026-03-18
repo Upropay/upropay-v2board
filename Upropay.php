@@ -17,7 +17,7 @@ class UproPay {
         return [
             'api_url' => [
                 'label' => 'API URL',
-                'description' => '例如: https://upropay.vip',
+                'description' => '',
                 'type' => 'input',
             ],
             'api_key' => [
@@ -55,6 +55,10 @@ class UproPay {
 
     public function pay($order)
     {
+        if (!filter_var($this->config['api_url'], FILTER_VALIDATE_URL)) {
+            abort(500, 'UproPay: API URL 非法');
+        }
+
         $client = new Client([
             'base_uri' => $this->config['api_url'],
             'timeout'  => 10.0,
@@ -62,10 +66,19 @@ class UproPay {
 
         $merchantOrderId = ($this->config['order_prefix'] ?? '') . $order['trade_no'];
 
+        // ✅ 金额修复（避免 float 精度问题）
+        $amount = number_format($order['total_amount'] / 100, 2, '.', '');
+
+        // ✅ chain 标准化
+        $chain = strtoupper($this->config['chain'] ?? 'TRON');
+        if (!in_array($chain, ['TRON', 'BSC'])) {
+            $chain = 'TRON';
+        }
+
         $payload = [
             'merchantOrderId' => $merchantOrderId,
-            'amount' => (float)($order['total_amount'] / 100),
-            'chain' => $this->config['chain'] ?? 'TRON',
+            'amount' => $amount,
+            'chain' => $chain,
             'notifyUrl' => $order['notify_url'],
             'redirectUrl' => !empty($this->config['return_url']) ? $this->config['return_url'] : $order['return_url']
         ];
@@ -92,33 +105,40 @@ class UproPay {
 
             $paymentUrl = $result['paymentUrl'];
             $returnUrl = !empty($this->config['return_url']) ? $this->config['return_url'] : $order['return_url'];
-            if ($returnUrl) {
+
+            // ✅ 防重复拼接 redirectUrl
+            if ($returnUrl && strpos($paymentUrl, 'redirectUrl=') === false) {
                 $paymentUrl .= (strpos($paymentUrl, '?') === false ? '?' : '&') . 'redirectUrl=' . urlencode($returnUrl);
             }
 
             return [
-                'type' => 1, // 0:qrcode 1:url
+                'type' => 1,
                 'data' => $paymentUrl
             ];
         } catch (\Exception $e) {
             $message = $e->getMessage();
+
             if ($e instanceof \GuzzleHttp\Exception\ClientException) {
                 $response = $e->getResponse();
                 if ($response) {
                     $body = json_decode($response->getBody()->getContents(), true);
-                    $serverMsg = isset($body['message']) ? $body['message'] : '未知错误';
+                    $serverMsg = $body['message'] ?? '未知错误';
+
                     if ($response->getStatusCode() === 403) {
                         abort(500, '域名未授权: ' . $serverMsg);
                     }
+
                     if ($response->getStatusCode() === 404) {
                         if (strpos($serverMsg, 'No active wallet found') !== false) {
                             abort(500, '收款地址不存在: ' . $serverMsg);
                         }
                         abort(500, '接口 404: ' . $serverMsg);
                     }
+
                     $message = "接口返回({$response->getStatusCode()}): " . $serverMsg;
                 }
             }
+
             abort(500, 'UproPay: ' . $message);
         }
     }
@@ -135,36 +155,67 @@ class UproPay {
             unset($payload['signature']);
         }
 
-        // Try to verify using the parsed array (common for Node.js/JSON APIs)
+        // ✅ JSON 签名验证
         $jsonPayload = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         $expected = hash_hmac('sha256', $jsonPayload, $this->config['webhook_secret']);
 
-        if ($signature !== $expected) {
-            // Try raw body if signature is from header (just in case the server signed the whole raw body)
+        if (!hash_equals($expected, $signature)) {
+            // fallback: raw body
             $rawPayload = request()->getContent();
             $expectedRaw = hash_hmac('sha256', $rawPayload, $this->config['webhook_secret']);
-            if ($signature !== $expectedRaw) {
+
+            if (!hash_equals($expectedRaw, $signature)) {
                 \Illuminate\Support\Facades\Log::error('UproPay notify signature verify failed', [
                     'signature' => $signature,
                     'expected_json' => $expected,
                     'expected_raw' => $expectedRaw,
-                    'json_payload' => $jsonPayload,
                     'params' => $params
                 ]);
                 return false;
             }
         }
 
+        // ✅ 状态校验
         if (strtoupper($params['status']) !== 'CONFIRMED') {
             return false;
         }
 
+        // 订单号处理
         $tradeNo = $params['merchantOrderId'];
         if (!empty($this->config['order_prefix'])) {
             if (strpos($tradeNo, $this->config['order_prefix']) === 0) {
                 $tradeNo = substr($tradeNo, strlen($this->config['order_prefix']));
             }
         }
+
+        // ✅ 金额校验（核心安全）
+        if (!isset($params['amount'])) {
+            return false;
+        }
+
+        $callbackAmount = number_format((float)$params['amount'], 2, '.', '');
+
+        $order = \App\Models\Order::where('trade_no', $tradeNo)->first();
+        if (!$order) {
+            return false;
+        }
+
+        $orderAmount = number_format($order->total_amount / 100, 2, '.', '');
+
+        if ($callbackAmount !== $orderAmount) {
+            \Illuminate\Support\Facades\Log::error('UproPay amount mismatch', [
+                'trade_no' => $tradeNo,
+                'callback_amount' => $callbackAmount,
+                'order_amount' => $orderAmount
+            ]);
+            return false;
+        }
+
+        // ✅ 成功日志（建议保留）
+        \Illuminate\Support\Facades\Log::info('UproPay notify success', [
+            'trade_no' => $tradeNo,
+            'amount' => $callbackAmount
+        ]);
 
         return [
             'trade_no' => $tradeNo,
