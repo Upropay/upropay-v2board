@@ -189,11 +189,11 @@ class UproPay {
         }
 
         // ✅ 金额校验（核心安全）
-        if (!isset($params['amount'])) {
+        if (!isset($params['fiatAmount'])) {
             return false;
         }
 
-        $callbackAmount = number_format((float)$params['amount'], 2, '.', '');
+        $callbackAmount = number_format((float)$params['fiatAmount'], 2, '.', '');
 
         $order = \App\Models\Order::where('trade_no', $tradeNo)->first();
         if (!$order) {
